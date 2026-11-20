@@ -1,5 +1,14 @@
 # trae_card 固件文本日志补丁指南
 
+> **✅ 2026-11-20 状态：已实现、已烧录、已实测验证。**
+> 源码 [arraylee/ai-passport-xiaozhi-custom](https://github.com/arraylee/ai-passport-xiaozhi-custom)（FoloToy 官方 play `xiaozhi-ai-chatbot` 的 githubUrl），补丁在 `textlog` 分支 @ 5ae1e1d（+4 行）。
+> 实测串口输出（UTF-8 中文完好、会话号配对）：
+> ```
+> I (452529) xiaozhi: TEXTLOG	user	80fea708	hello helllo.
+> I (453164) xiaozhi: TEXTLOG	ai	80fea708	哎呀，爸爸你这是在跟我打招呼呀，还是自己练英语呢？
+> ```
+> 构建产物与官方 bin 字节数完全一致（5,687,560 B，仅 bootloader/app 不同，资产段相同）。
+
 **目的**：在 trae_card（小智衍生固件，v2.1.0-xiaozhi.29）中恢复对话文本的串口日志输出，使"设备侧自动记忆采集"成为可能。
 **依据**：device-text-capture-probe.md 的判定（文本到达设备、日志层被魔改丢弃）。
 **上游参照**：xiaozhi-esp32 @ 831ffd1（本地克隆 `D:\dsh\ws\xiaozhi-esp32`）。
@@ -68,8 +77,31 @@ ESP_LOGI(TAG, "TEXTLOG\tuser\t%s\t%s", session, text->valuestring);
 
 ## 5. 验证清单（烧录后）
 
-- [ ] 问一句"今天天气怎么样" → 串口出现 `TEXTLOG user ...` 与 `TEXTLOG ai ...` 各至少一行
-- [ ] 长回答 → 多行 `TEXTLOG ai`（逐句）且顺序完整
+- [x] 问一句"今天天气怎么样" → 串口出现 `TEXTLOG user ...` 与 `TEXTLOG ai ...` 各至少一行 ✅ 2026-11-20 实测（12 行 / 6 轮）
+- [x] 长回答 → 多行 `TEXTLOG ai`（逐句）且顺序完整 ✅ 实测连续 ai 行成对出现
+- [x] `sid` 字段是否为空（空则启用本地轮次配对）✅ 非空且按会话变化（c79913f7、80fea708），本地轮次配对不需要
 - [ ] 打断（按"打断"）→ 已收句子不丢、后续句子停止
 - [ ] 深睡唤醒 → 看门狗捕获自动续上，TEXTLOG 行无丢失
-- [ ] `sid` 字段是否为空（空则启用本地轮次配对）
+
+## 6. 实际落地的构建与烧录配方（Windows）
+
+**补丁实现**（与 §2 建议一致，session 取自 `c->session` 而非 root，两处插入点：tts sentence_start 分支、stt 分支 farewell 判断之前）：
+- `components/platform/xiaozhi/xiaozhi.c`：`ESP_LOGI(TAG, "TEXTLOG\tai\t%s\t%s", c->session, line->valuestring);` 与 `ESP_LOGI(TAG, "TEXTLOG\tuser\t%s\t%s", c->session, line->valuestring);`
+
+**构建**（ESP-IDF v5.5.3 装在 `D:\dsh\tools\esp-idf`，完整脚本 `D:\dsh\tools\build-miniapp.cmd`）：
+1. `call D:\dsh\tools\esp-idf\export.bat`（**必须 call**，直接 && 链会被 export.bat 的 exit 杀掉）
+2. `set "IDF_PATH=D:/dsh/tools/esp-idf"`（**必须正斜杠**：recovery_boot_hook 的 CMakeLists 用 `$ENV{IDF_PATH}` 拼路径，反斜杠 `\d` 会让 CMake 报 "Invalid character escape"）
+3. `idf.py -B build-miniapp -DSDKCONFIG=<绝对路径>\build-miniapp\sdkconfig -DPASSPORT_MINIAPP=ON build`（SDKCONFIG 必须绝对路径，cmd 的 %CD% 单行展开是旧目录）
+4. 打包：IDF python 跑 `tools/pack_miniapp.py --build-dir build-miniapp --output releases/...-miniapp.bin`（自带资产 SHA 全套校验）
+
+**烧录**（= 官方小程序安装器等效操作，六段写入）：
+```
+python -m esptool --chip esp32c3 -p COM4 --baud 460800 write_flash "@flash_args"
+# 在 build-miniapp 目录：0x0 bootloader / 0x8000 分区表 / 0x10000 trae_card.bin
+# / 0x2de000 petart / 0x3bb000 companion / 0x54d000 imgava
+```
+**不触碰**：nvs(0x9000)、cardid、netcfg、recovery(0x6c0000 常驻安装器)——WiFi、云端身份（MAC 绑定）、微信小程序生态全部保留。
+
+**还原保险**：烧录前全片备份 `D:\dsh\backup\passport-2.1.0-xiaozhi.29-full-8mb.bin`（8,388,608 B）；官方原版 bin 可随时从 play API `/api/download/official/xiaozhi-ai-chatbot` 下载（sha256 40940a3d…）。
+
+**采集注意**：System.IO.Ports.SerialPort 默认 ASCII 编码会把中文读成 `?`，必须设 `sp.Encoding = [Text.Encoding]::UTF8`。
