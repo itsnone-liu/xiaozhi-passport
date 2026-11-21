@@ -47,6 +47,7 @@ Caddy :443 (TLS-ALPN-01,LE 证书,域名 199.68.217.229.sslip.io,不占用 :80)
 |---|---|
 | 自测事件（user+ai）落库 | ✅ boot cb64a0bb seq 0/1，accepted:2 rejected:0 |
 | 真实对话落库 | ✅ boot 416d3784："会不会什么呀？""你话说一半，我没听明白。" |
+| **脱机电池场景（拔 USB）** | ✅ boot cb64a0bb 03:53:33 一批两条（user"测试测试。"+ai 应答），boot 未断，说话入队/空闲打包符合设计 |
 | 幂等（原样重发） | ✅ accepted:0（PC 预演 + 协议级 UNIQUE 保障） |
 | 错误令牌 | ✅ HTTP 401 |
 | 语音链路共存 | ✅ mqtt connected 在前、队列分配在后；TTS 期间不上传 |
