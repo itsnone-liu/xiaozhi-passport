@@ -40,6 +40,19 @@ Caddy :443 (TLS-ALPN-01,LE 证书,域名 199.68.217.229.sslip.io,不占用 :80)
 3. **direction 截断**：结构体 `char direction[4]` 容不下 "user\0" → strlcpy 截为
    "use" → 服务端校验拒收。症状=每批恰好 1 条 rejected、仅 user 方向。
    修复=`char direction[8]`。此 bug 由服务端 ACK 正文回读（`XZU ack` 行）定位。
+4. **资源长占导致重配网失败**（当晚用户反馈"重新配网→语音连接未完成"）：
+   上传模块虽已惰性创建，但语音会话结束后队列/任务仍常驻 ~10KB，语音停止再启动时
+   堆被切碎，`xz_codec_memory_begin()` 申请整块 24KB 失败
+   （日志：`heap=127932 largest=49152` 仍 `alloc_failed size=24576`）。
+   修复=**用完即还**：`xiaozhi_service()` 在语音停止时调用 `xz_uploader_teardown()`
+   释放队列并自删任务；队列排空且待机 60s 也自动释放。
+5. **配网与语音耦合（疑似既有缺陷，本次暴露）**：`run_session()` 在打开配网门户
+   **之前**先申请 24KB codec arena，一次失败即 `goto finish`
+   （`error_origin=942` "语音内存不足"），配网页根本没机会启动。
+   修复=配网路径（`setup_requested`）跳过 arena，门户开好后再申请语音内存；
+   另加 arena 申请 3 次重试（应付 BLE 控制器刚释放时堆未归并）。
+   修复后现场验证：门户 httpd 正常响应手机探测（`/generate_204`、`/mmtls`），
+   设备成功连上新 WiFi（`wifi:connected with vivo S16 Pro`, RSSI -21）。
 
 ## 4. 验收记录
 
@@ -53,6 +66,8 @@ Caddy :443 (TLS-ALPN-01,LE 证书,域名 199.68.217.229.sslip.io,不占用 :80)
 | 语音链路共存 | ✅ mqtt connected 在前、队列分配在后；TTS 期间不上传 |
 | 证书校验 | ✅ esp-x509-crt-bundle "Certificate validated"（设备日志） |
 | 中文 UTF-8 | ✅ 全链路无乱码 |
+| 手机会话热点档案 | ✅ NVS `wifi_profiles` = `153-702` + `vivo S16 Pro`；实测 `wifi:connected with vivo S16 Pro`（RSSI -21），切换零固件改动 |
+| 重配网可用性 | ✅ 修复后配网门户正常响应（手机 captive 探测 `/generate_204`、`/mmtls`）并保存新档案 |
 
 ## 5. 遗留与已知边界
 
