@@ -1,4 +1,5 @@
 #include "xiaozhi.h"
+#include "xz_uploader.h"
 #include "xz_codec_memory.h"
 #include "xz_services.h"
 #include "xz_radio_player.h"
@@ -521,6 +522,7 @@ static bool open_channel(channel_t *c, cJSON **cloud) {
   ESP_LOGI(TAG,"mqtt connected heap=%u largest=%u",(unsigned)esp_get_free_heap_size(),
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   codec_arena_metric(4);
+  xz_uploader_on_cloud_ready();   // 语音链路已建立后,上传模块才允许占用内存(P1-2 资源纪律)
   if (atomic_load(&cancel) || atomic_load(&c->failed)) return false;
   if (subscribe[0]) {
     atomic_store(&c->suback_id, -1);
@@ -1127,6 +1129,7 @@ static session_end_t run_session(bool *wifi_up, xz_quiet_t *quiet, unsigned *mis
           } else if (!strcmp(state->valuestring, "sentence_start") &&
                      cJSON_IsString(line) && working.phase == XZ_SPEAK) {
             ESP_LOGI(TAG, "TEXTLOG\tai\t%s\t%s", c->session, line->valuestring);
+            xz_uploader_enqueue("ai", c->session, line->valuestring);
             if (line->valuestring[0]) tts_text = true;
             status(XZ_SPEAK, xz_display_text(line->valuestring));
           }
@@ -1134,6 +1137,7 @@ static session_end_t run_session(bool *wifi_up, xz_quiet_t *quiet, unsigned *mis
           // Log the user transcript before farewell handling so goodbye
           // utterances are captured too.
           ESP_LOGI(TAG, "TEXTLOG\tuser\t%s\t%s", c->session, line->valuestring);
+          xz_uploader_enqueue("user", c->session, line->valuestring);
           // Some sessions deliver the user's transcript after TTS start.
           // Accept a goodbye in either order, before draining queued audio.
           if (xz_is_farewell(line->valuestring)) {

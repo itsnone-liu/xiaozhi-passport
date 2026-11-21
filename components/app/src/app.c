@@ -11,6 +11,8 @@
 #include "services/battery.h"
 #include "services/factory_test.h"
 #include "xiaozhi.h"
+#include "xz_uploader.h"
+#include "tls_probe.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -2591,6 +2593,19 @@ static int on_at_command(const char *line, int len, char *out, int n, void *user
             xiaozhi_stop();
             return at_reply(out, n, "+OK voice_stop_requested\r\n");
         }
+        if (at_is(a, "upload,selftest")) {
+            xz_uploader_selftest(2);
+            return at_reply(out, n, "+OK upload_selftest_queued\r\n");
+        }
+        if (at_is(a, "upload,send")) {
+            xz_uploader_flush();
+            return at_reply(out, n, "+OK upload_flush_requested\r\n");
+        }
+        if (at_is(a, "tlsprobe") || !strncmp(a, "tlsprobe,", 9)) {
+            const char *label = a[8] == ',' ? a + 9 : "plain";
+            return at_reply(out, n, tls_probe_start(label) ?
+                "+OK tlsprobe_queued\r\n" : "+ERR=busy\r\n");
+        }
         if (at_is(a, "restart") || at_is(a, "restart,now")) return at_reboot(out, n);   // restart / restart,now
         return at_reply(out, n, "+ERR=command(未知,用 at+command=? 查看)\r\n");
     }
@@ -2610,6 +2625,32 @@ static int on_at_command(const char *line, int len, char *out, int n, void *user
                 hal_identity_is_provisioned(s_id), s_profile.volume,
                 s_profile.sleep_min * 60, s_profile.name);
         }
+        if ((b = at_after(a, "upload,"))) {
+            if (b[0] == '?' && b[1] == '\0') {
+                uint32_t p, d, t, ok, f, dnr, seq; const char *dev, *boot;
+                xz_uploader_stats(&p, &d, &t, &ok, &f, &dnr);
+                xz_uploader_identity(&dev, &boot, &seq);
+                return at_reply(out, n,
+                    "+UPLOAD: en=%d,url=%s,token_tail=…%s,pending=%u,dropped=%u,"
+                    "trunc=%u,sent=%u,fail=%u,not_ready=%u,boot=%s,seq=%lu,dev=%s\r\n",
+                    xz_uploader_enabled(), xz_uploader_url(), xz_uploader_token_tail(),
+                    p, d, t, ok, f, dnr, boot, (unsigned long)seq, dev);
+            }
+            if ((c = at_after(b, "url,")))
+                return at_reply(out, n, xz_uploader_set_url(c) ?
+                    "+OK url_saved\r\n" : "+ERR=save\r\n");
+            if ((c = at_after(b, "token,")))
+                return at_reply(out, n, xz_uploader_set_token(c) ?
+                    "+OK token_saved\r\n" : "+ERR=save\r\n");
+            if ((c = at_after(b, "enable,"))) {
+                int v;
+                if (!at_decimal(c, 1, &v)) return at_reply(out, n, "+ERR=arg(0..1)\r\n");
+                return at_reply(out, n, xz_uploader_set_enabled(v != 0) ?
+                    "+OK enable=%d\r\n" : "+ERR=save\r\n", v);
+            }
+            return at_reply(out, n, "+ERR=key(用 at+config=upload,? 查看)\r\n");
+        }
+
         if (!(b = at_after(a, "common,")))
             return at_reply(out, n, "+ERR=arg(仅支持 common 组)\r\n");
 
@@ -2790,6 +2831,7 @@ void app_run(void) {
     // 设备名用本机 SN:网关扫一下就知道是哪张卡,不必靠台账反查。
     char dev_sn[16] = {0};
     hal_identity_get_sn(s_id, dev_sn, sizeof dev_sn);
+    xz_uploader_init(dev_sn);   // P1-2 无线上传(配置在 NVS,默认停用)
     hal_config_t *cfg_src = platform_create_ble_config(&board, dev_sn);
     s_cfg = cfg_src;
 #if PERIPH_DISPLAY
