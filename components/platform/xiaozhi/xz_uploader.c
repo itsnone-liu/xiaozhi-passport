@@ -57,6 +57,7 @@ typedef struct {
     uint32_t seq_next;
     uint32_t dropped_full;    // 队列满丢新
     uint32_t dropped_not_ready; // 队列尚未建立(云端未连/未启用)期间丢弃
+    uint32_t dropped_teardown;  // 释放(语音停止/进配网/久闲)时未及上传丢弃
     uint32_t truncated;       // 文本截断次数
     uint32_t sent_ok;         // 成功上传事件数
     uint32_t send_fail;       // POST 失败次数
@@ -72,6 +73,8 @@ typedef struct {
     uint32_t backoff_ms;
     bool inited;
     bool cloud_ready;
+    volatile bool teardown;    // 语音停止/进配网 → 任务自释放全部内存后自删
+    volatile bool task_alive;  // 上传任务存活标记(start_now/自删 互斥用)
 } xzu_t;
 
 static xzu_t S;
@@ -130,25 +133,22 @@ bool xz_uploader_set_enabled(bool on) {
 // ---------- 采集侧(被 xiaozhi.c 消息回调调用,绝不允许阻塞) ----------
 void xz_uploader_enqueue(const char *direction, const char *session,
                          const char *text) {
-    if (!S.inited || !S.ring || !text || !text[0]) {
-        if (S.inited && text && text[0]) {
-            taskENTER_CRITICAL(&S.lock);
-            S.dropped_not_ready++;
-            taskEXIT_CRITICAL(&S.lock);
-        }
+    if (!S.inited || !text || !text[0]) return;
+    if (!S.ring) {   // 云端未连/未启用/已释放:纯串口 TEXTLOG 降级
+        taskENTER_CRITICAL(&S.lock);
+        S.dropped_not_ready++;
+        taskEXIT_CRITICAL(&S.lock);
         return;
     }
+    // 整个填充在临界区内完成:与 teardown 的释放互斥,杜绝悬垂指针。
+    // ~240B memcpy 在 160MHz 下约几十微秒,消息回调任务可承受。
     taskENTER_CRITICAL(&S.lock);
-    if (S.count >= XZU_SLOTS) {
-        S.dropped_full++;
+    if (!S.ring || S.count >= XZU_SLOTS) {
+        if (!S.ring) S.dropped_not_ready++; else S.dropped_full++;
         taskEXIT_CRITICAL(&S.lock);
         return;
     }
     xzu_event_t *e = &S.ring[S.head];
-    taskEXIT_CRITICAL(&S.lock);
-
-    // 槽位内容只在 count 增加前可见,可安全地在临界区外填充
-    memset(e, 0, sizeof *e);
     e->seq = S.seq_next++;
     e->mono_ms = (uint32_t)(esp_timer_get_time() / 1000);
     strlcpy(e->direction, direction == NULL ? "?" : direction, sizeof e->direction);
@@ -156,21 +156,11 @@ void xz_uploader_enqueue(const char *direction, const char *session,
     size_t len = strlen(text);
     if (len > XZU_TEXT_MAX - 1) {
         len = XZU_TEXT_MAX - 1;
-        e->len = (uint16_t)len;
-        memcpy(e->text, text, len);
-        e->text[len] = '\0';
-        taskENTER_CRITICAL(&S.lock); S.truncated++; taskEXIT_CRITICAL(&S.lock);
-    } else {
-        e->len = (uint16_t)len;
-        memcpy(e->text, text, len + 1);
+        S.truncated++;
     }
-
-    taskENTER_CRITICAL(&S.lock);
-    if (S.count >= XZU_SLOTS) {   // 填充期间队列满:丢弃本条(保守,不覆盖)
-        S.dropped_full++;
-        taskEXIT_CRITICAL(&S.lock);
-        return;
-    }
+    memcpy(e->text, text, len);
+    e->text[len] = '\0';
+    e->len = (uint16_t)len;
     S.head = (uint8_t)((S.head + 1) % XZU_SLOTS);
     S.count++;
     taskEXIT_CRITICAL(&S.lock);
@@ -196,13 +186,14 @@ unsigned xz_uploader_pending(void) { return S.count; }
 
 void xz_uploader_stats(uint32_t *pending, uint32_t *dropped, uint32_t *truncated,
                        uint32_t *sent_ok, uint32_t *send_fail,
-                       uint32_t *dropped_not_ready) {
+                       uint32_t *dropped_not_ready, uint32_t *dropped_teardown) {
     if (pending) *pending = S.count;
     if (dropped) *dropped = S.dropped_full;
     if (truncated) *truncated = S.truncated;
     if (sent_ok) *sent_ok = S.sent_ok;
     if (send_fail) *send_fail = S.send_fail;
     if (dropped_not_ready) *dropped_not_ready = S.dropped_not_ready;
+    if (dropped_teardown) *dropped_teardown = S.dropped_teardown;
 }
 
 void xz_uploader_identity(const char **device_id, const char **boot_id,
@@ -325,10 +316,37 @@ static bool post_batch(char *body, size_t len) {
 
 static void upload_task(void *arg) {
     static char body[XZU_BODY_MAX];   // 单飞任务私有,静态复用
+    uint32_t idle_drained_ticks = 0;  // 队列排空且处待机相位的连续秒数
     while (true) {
         if (S.kick) xSemaphoreTake(S.kick, pdMS_TO_TICKS(XZU_TICK_MS));
-        if (!S.inited || !S.enabled || !S.url[0] || !S.token[0] || S.count == 0)
+
+        if (S.teardown) {   // 语音停止/进配网:还清全部内存后自删
+            taskENTER_CRITICAL(&S.lock);
+            if (S.count) { S.dropped_teardown += S.count; S.count = 0; }
+            heap_caps_free(S.ring);
+            S.ring = NULL;
+            S.cloud_ready = false;
+            S.task_alive = false;
+            taskEXIT_CRITICAL(&S.lock);
+            ESP_LOGI(TAG, "上传模块已释放(teardown) 丢 %u 事件 heap=%u largest=%u",
+                     S.dropped_teardown, (unsigned)esp_get_free_heap_size(),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+            vTaskDelete(NULL);   // 自删:栈由空闲任务回收
+        }
+
+        if (!S.inited || !S.enabled || !S.url[0] || !S.token[0] || S.count == 0) {
+            // 排空且处于待机:连续 60s 无新事件 → 还内存(防碎片挤占下次语音启动)
+            if (S.count == 0 && audio_safe_phase()) {
+                if (++idle_drained_ticks >= 60) {
+                    S.teardown = true;   // 走上面的自释放路径
+                    continue;
+                }
+            } else {
+                idle_drained_ticks = 0;
+            }
             continue;
+        }
+        idle_drained_ticks = 0;
         if (S.backoff_ms) {   // 失败退避中(带抖动)
             vTaskDelay(pdMS_TO_TICKS(S.backoff_ms));
             S.backoff_ms = 0;
@@ -395,7 +413,9 @@ bool xz_uploader_init(const char *device_id) {
 }
 
 // 前置条件全部满足时真正占内存:队列 + 上传任务。幂等。
-static void start_now(void) {    if (S.ring || !S.cloud_ready || !S.enabled || !S.url[0] || !S.token[0])
+static void start_now(void) {
+    if (S.ring || S.task_alive || !S.cloud_ready || !S.enabled ||
+        !S.url[0] || !S.token[0])
         return;
     S.ring = heap_caps_calloc(XZU_SLOTS, sizeof(xzu_event_t), MALLOC_CAP_DEFAULT);
     if (!S.ring) {
@@ -403,15 +423,26 @@ static void start_now(void) {    if (S.ring || !S.cloud_ready || !S.enabled || !
                  (unsigned)(XZU_SLOTS * sizeof(xzu_event_t)));
         return;
     }
+    S.teardown = false;   // 新一代任务清旗,防继承旧 teardown
     if (xTaskCreate(upload_task, "xzu", XZU_TASK_STACK, NULL, 2, NULL) != pdPASS) {
         heap_caps_free(S.ring);
         S.ring = NULL;
         ESP_LOGW(TAG, "上传任务创建失败 —— 保持纯串口 TEXTLOG 模式");
         return;
     }
+    S.task_alive = true;
     ESP_LOGI(TAG, "上传队列就绪(%u 槽) heap=%u largest=%u", XZU_SLOTS,
              (unsigned)esp_get_free_heap_size(),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+}
+
+// 语音链路即将停止(重新配网/重启语音/休眠)时由 xiaozhi.c 调用:
+// 任务在 ≤1s 内释放全部内存并自删,把完整堆还给下一次语音启动。
+// 队列中未及上传的事件计入 dropped_teardown(串口 TEXTLOG 仍有全量)。
+void xz_uploader_teardown(void) {
+    if (!S.inited || !S.task_alive) return;
+    S.teardown = true;
+    if (S.kick) xSemaphoreGive(S.kick);
 }
 
 // 云端语音链路建立成功后由 xiaozhi.c 调用(P1-2 资源纪律:

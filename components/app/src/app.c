@@ -2627,12 +2627,13 @@ static int on_at_command(const char *line, int len, char *out, int n, void *user
         }
         if ((b = at_after(a, "upload,"))) {
             if (b[0] == '?' && b[1] == '\0') {
-                uint32_t p, d, t, ok, f, dnr, seq; const char *dev, *boot;
-                xz_uploader_stats(&p, &d, &t, &ok, &f, &dnr);
+                uint32_t p, d, t, ok, f, dnr, dtd, seq; const char *dev, *boot;
+                xz_uploader_stats(&p, &d, &t, &ok, &f, &dnr, &dtd);
                 xz_uploader_identity(&dev, &boot, &seq);
                 return at_reply(out, n,
                     "+UPLOAD: en=%d,url=%s,token_tail=…%s,pending=%u,dropped=%u,"
-                    "trunc=%u,sent=%u,fail=%u,not_ready=%u,boot=%s,seq=%lu,dev=%s\r\n",
+                    "trunc=%u,sent=%u,fail=%u,not_ready=%u,drop_teardown=%u,"
+                    "boot=%s,seq=%lu,dev=%s\r\n",
                     xz_uploader_enabled(), xz_uploader_url(), xz_uploader_token_tail(),
                     p, d, t, ok, f, dnr, boot, (unsigned long)seq, dev);
             }

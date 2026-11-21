@@ -902,6 +902,26 @@ static bool reply_audio_missing(bool text, uint32_t written, bool stopped, uint6
   // audio is not: give delayed UDP a grace period, then renew its transport.
   return !written && (stopped ? text && idle_ms >= 1500 : idle_ms >= 10000);
 }
+// 申请语音编解码内存(24KB arena + 双向探测)。带重试:BLO/BLE 控制器
+// 刚释放时堆尚未归并,首次 malloc 可能失败而 free/largest 看着够用。
+static bool codec_prepare(bool *owned) {
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    if (xz_codec_memory_begin()) {
+      *owned = true;
+      codec_arena_metric(0);
+      if (!codec_probe() || atomic_load(&cancel)) return false;
+      codec_arena_metric(1);
+      return true;
+    }
+    codec_arena_metric(0);
+    ESP_LOGW(TAG, "codec arena 第 %d 次申请失败 largest=%u,150ms 后重试",
+             attempt + 1,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    vTaskDelay(pdMS_TO_TICKS(150));
+  }
+  return false;
+}
+
 static session_end_t run_session(bool *wifi_up, xz_quiet_t *quiet, unsigned *missing_replies) {
   xz_radio_unqueue();
   session_end_t outcome = SESSION_CLOSED;
@@ -924,6 +944,10 @@ static session_end_t run_session(bool *wifi_up, xz_quiet_t *quiet, unsigned *mis
   bool tts_stop = false, tts_text = false, encoder_measured = false;
   uint32_t tts_received = 0, tts_valid = 0, tts_written = 0;
   working.stage = XZ_STAGE_VOICE;
+  // 配网与语音解耦:开热点/配网门户只需要 WiFi,不需要 24KB 音频编解码内存。
+  // 旧流程在 portal 之前先申请 arena,一次失败就报"语音内存不足"退出,
+  // 配网页永远起不来(用户侧表现为"重新配网→语音连接未完成")。
+  const bool setup_now = setup_requested;
   if (xz_theme_pending_boot()) {
     if (!*wifi_up && !xz_wifi_open(setup_requested,&cancel,status,working.hotspot,working.password)) goto finish;
     *wifi_up=true; warm=true; setup_requested=false; working.wifi_saved=true;
@@ -937,14 +961,11 @@ static session_end_t run_session(bool *wifi_up, xz_quiet_t *quiet, unsigned *mis
     status(XZ_STANDBY,xz_theme_last_error());
     outcome=SESSION_THEME_FAILED; goto finish;
   }
-  if (!xz_codec_memory_begin()) {
-    codec_arena_metric(0);
-    status(XZ_ERROR, "语音内存不足，请返回后重试"); goto finish;
+  if (!setup_now) {   // 配网路径延后到门户开好之后再要 codec 内存
+    if (!codec_prepare(&codec_memory_owned)) {
+      status(XZ_ERROR, "语音内存不足，请返回后重试"); goto finish;
+    }
   }
-  codec_memory_owned = true;
-  codec_arena_metric(0);
-  if (!codec_probe() || atomic_load(&cancel)) goto finish;
-  codec_arena_metric(1);
   working.stage = XZ_STAGE_WIFI;
   if (!warm) {
     if (!xz_wifi_open(setup_requested, &cancel, status, working.hotspot, working.password))
@@ -960,6 +981,13 @@ static session_end_t run_session(bool *wifi_up, xz_quiet_t *quiet, unsigned *mis
            (unsigned)uxTaskGetStackHighWaterMark(NULL));
   codec_arena_metric(2);
   ESP_LOGI(TAG,"wifi_signal_rssi=%d",xz_wifi_rssi());
+  if (setup_now && !atomic_load(&cancel)) {
+    // 门户已工作(凭据可能已保存)。现在才为本次会话要语音内存;
+    // 即使这里失败,配网结果也已持久化,用户重启语音即可正常对话。
+    if (!codec_prepare(&codec_memory_owned)) {
+      status(XZ_ERROR, "语音内存不足，请返回后重试"); goto finish;
+    }
+  }
   if (atomic_load(&cancel))
     goto finish;
   working.wifi_saved = true; // xz_wifi_open succeeds only after durable profile save.
@@ -1587,6 +1615,7 @@ void xiaozhi_service(void) {
   voice_task = NULL;
   atomic_store(&worker_finished, false);
   restore_radio();
+  xz_uploader_teardown();   // 语音停止:释放上传队列/任务,还完整堆给下次启动/配网
   if (atomic_load(&cancel) && !working.restart_required) status(XZ_OFF, "");
   ESP_LOGI(TAG, "voice stopped heap=%u largest=%u",
            (unsigned)esp_get_free_heap_size(),

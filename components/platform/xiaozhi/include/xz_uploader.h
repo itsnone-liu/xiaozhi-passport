@@ -16,6 +16,10 @@ bool xz_uploader_init(const char *device_id);
 // P1-2 资源纪律:官方语音 TLS 握手优先享有全部内存。
 void xz_uploader_on_cloud_ready(void);
 
+// 语音链路即将停止(重新配网/重启语音/休眠)时调用:
+// 释放队列+任务,把完整堆还给下一次语音启动(防碎片挤死 codec 24KB 整块申请)。
+void xz_uploader_teardown(void);
+
 // 采集入口(xiaozhi.c stt / tts sentence_start 分支调用;非阻塞)。
 void xz_uploader_enqueue(const char *direction, const char *session_id,
                          const char *text);
@@ -38,7 +42,7 @@ const char *xz_uploader_token_tail(void);        // 只回显末 4 位
 unsigned xz_uploader_pending(void);
 void xz_uploader_stats(uint32_t *pending, uint32_t *dropped, uint32_t *truncated,
                        uint32_t *sent_ok, uint32_t *send_fail,
-                       uint32_t *dropped_not_ready);
+                       uint32_t *dropped_not_ready, uint32_t *dropped_teardown);
 void xz_uploader_identity(const char **device_id, const char **boot_id,
                           uint32_t *seq_next);
 
