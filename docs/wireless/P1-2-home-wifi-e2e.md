@@ -82,6 +82,10 @@ Caddy :443 (TLS-ALPN-01,LE 证书,域名 199.68.217.229.sslip.io,不占用 :80)
 
 - 服务器健康：`curl https://199.68.217.229.sslip.io/health`
 - 设备侧状态：串口 115200 发 `at+config=upload,?`（en/url/token尾4位/pending/dropped/sent/fail/boot_id/seq）
+- WiFi 现状与档案顺序：`at+command=wifi,?` → `+WIFI: cur=<当前AP>,rssi=<dBm>,profiles=<0号=首选>|…`
+- 切换网络（不改密码、无需重配网）：`at+command=wifi,use,<ssid前缀>` → 置顶该档案 → `at+reboot`
+  - 依据：`xz_wifi_profiles_rank()` 规则为"items[0] 一旦被扫到就永远优先，其余按 RSSI"；
+    因此置顶即等于"下次连它"，且该网络不在范围内时自动回落到最强可用档案（出门用热点无需再切回）。
 - 手动自测：`at+command=upload,selftest`（session=selftest，无儿童数据）
 - 立即冲刷：`at+command=upload,send`
 - 配置入口（NVS，不入代码库）：`at+config=upload,url,…` / `upload,token,…` / `upload,enable,0|1`
